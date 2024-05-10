@@ -15,9 +15,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.func import jacrev, vmap
 
 
-
-torch.cuda.manual_seed(0)
-torch.manual_seed(0)
+import random
 
 
 parser = argparse.ArgumentParser()
@@ -32,6 +30,8 @@ parser.add_argument('-init', default=1.0)
 parser.add_argument('-opt', default='sgd')
 parser.add_argument('-measure_every', default=25)
 parser.add_argument('-model', default='mlp')
+parser.add_argument('-width', type=int, default=512)
+parser.add_argument('-seed', type=int, default=0)
 args = parser.parse_args()
 
 for n_, v_ in args.__dict__.items():
@@ -51,7 +51,12 @@ init = float(args.init)
 OPT = args.opt
 MEASURE_EVERY = int(args.measure_every)
 
-print("LR",LR)
+SEED = int(args.seed)
+
+np.random.seed(SEED)
+random.seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.manual_seed(SEED)
 
 model_type = args.model
 criterion = nn.MSELoss()
@@ -404,6 +409,11 @@ def get_fmap_resnet(net_, last_layer):
     mlp = net_[1]
     return nn.Sequential(*[resnet, get_fmap(mlp, last_layer)]).eval()
 
+def get_fmap_vgg(net_, last_layer):
+    vgg = net_[0]
+    mlp = net_[1]
+    return nn.Sequential(*[vgg, get_fmap(mlp, last_layer)]).eval()
+
 def get_fully_linear_fmap(net_, last_layer):
     if last_layer==0:
         return nn.Identity()
@@ -451,7 +461,7 @@ def train_network(net, train_loader, test_loader, lr=LR, num_epochs=NUM_EPOCHS):
 #             train_loss = train_step(net, lr, WD, momentum, train_loader, layer_to_fix, warmup=True)
 #         else:
 #             train_loss = train_step(net, lr, WD, momentum, train_loader, layer_to_fix, warmup=False)
-
+        
         train_loss = train_step(net, lr, WD, momentum, train_loader, layer_to_fix, warmup=False, opt=OPT)
         test_loss = val_step(net, test_loader)
         
@@ -483,7 +493,6 @@ def train_network(net, train_loader, test_loader, lr=LR, num_epochs=NUM_EPOCHS):
                     if model_type=='mlp':
 
                         fmap = get_fmap(net, layer)
-                        # fmap = get_fully_linear_fmap(net,layer)
                         sub_model = get_submodel(net, layer)
 
                         phiX = fmap(train_X)
@@ -502,7 +511,6 @@ def train_network(net, train_loader, test_loader, lr=LR, num_epochs=NUM_EPOCHS):
                         sqrt_nfa[layer] = mat_cov(sqrt_agop, nfm)
 
                         fmap_next = get_fmap(net, layer+1)
-                        # fmap_next = get_fully_linear_fmap(net,layer+1)
                         phiX_next = fmap_next(train_X)
                         
                         SigmaB, SigmaW, SigmaT, _ = get_class_variance(phiX_next, train_y)
@@ -529,6 +537,32 @@ def train_network(net, train_loader, test_loader, lr=LR, num_epochs=NUM_EPOCHS):
                         sqrt_nfa[layer] = mat_cov(sqrt_agop, nfm)
 
                         fmap_next = get_fmap_resnet(net, layer+1)
+                        phiX_next = fmap_next(train_X)
+                        SigmaB, SigmaW, SigmaT, _ = get_class_variance(phiX_next, train_y)
+                        cov_B[layer], cov_W[layer], cov_T[layer] = SigmaB.trace(), SigmaW.trace(), SigmaT.trace()
+                        
+                        
+                    elif model_type=='vgg11':
+
+                        fmap = get_fmap_vgg(net, layer)
+                        with torch.no_grad():
+                            phiX = fmap(train_X)
+
+                        sub_model = get_submodel(net[1], layer)
+                        
+                        with torch.no_grad():
+                            agop = measure_agop(sub_model, phiX)
+                        sqrt_agop = matrix_sqrt(agop)
+
+                        W = getW(net[1], layer)
+                        nfm = W.T@W
+                        
+                        agops_t.append(agop.cpu())
+
+                        nfa[layer] = mat_cov(agop, nfm)
+                        sqrt_nfa[layer] = mat_cov(sqrt_agop, nfm)
+
+                        fmap_next = get_fmap_vgg(net, layer+1)
                         phiX_next = fmap_next(train_X)
                         SigmaB, SigmaW, SigmaT, _ = get_class_variance(phiX_next, train_y)
                         cov_B[layer], cov_W[layer], cov_T[layer] = SigmaB.trace(), SigmaW.trace(), SigmaT.trace()
@@ -575,23 +609,34 @@ if model_type=='mlp':
         nn.init.xavier_uniform_(layers[-1][0].weight, gain=inits[1+i])
 
     layers += [nn.Linear(k, NUM_CLASSES, bias=False)]
-
+    # nn.init.xavier_uniform_(layers[-1].weight, gain=0.01)
+    
     model = MLP(layers)
     model.cuda()
     
 elif model_type=='resnet18':
     layers = []
     inits = [init for _ in range(NUM_LAYERS)]
-    inits[0] = 0.05
-    inits[1] = 0.05
-    for i in range(NUM_LAYERS):
+    # inits[0] = 0.05
+    # inits[1] = 0.05
+    width = int(args.width)
+    layers += [
+                    nn.Sequential(nn.Linear(512, width, bias=False),
+                                  Activation()
+                                 )
+                ]
+    
+    for i in range(NUM_LAYERS-1):
         layers += [
-                    nn.Sequential(nn.Linear(512, 512, bias=False),
+                    nn.Sequential(nn.Linear(width, width, bias=False),
                                   Activation()
                                  )
                 ]
         nn.init.xavier_uniform_(layers[-1][0].weight, gain=inits[i])
-    layers += [nn.Linear(512, NUM_CLASSES, bias=False)]
+        
+    layers += [nn.Linear(width, NUM_CLASSES, bias=False)]
+    # nn.init.xavier_uniform_(layers[-1].weight, gain=0.01)
+    
     mlp = MLP(layers)
         
     resnet = torchvision.models.resnet18(weights=None)
@@ -602,6 +647,46 @@ elif model_type=='resnet18':
     resnet.fc = nn.Identity()
     
     model = nn.Sequential(*[resnet, mlp])
+    model.cuda()
+    
+elif model_type=='vgg11':
+    layers = []
+    inits = [init for _ in range(NUM_LAYERS)]
+    # inits[0] = 0.05
+    # inits[1] = 0.05
+    layers += [
+                    nn.Sequential(nn.Linear(16*512, 512, bias=False),
+                                  Activation()
+                                 )
+                ]
+    for i in range(NUM_LAYERS-1):
+        layers += [
+                    nn.Sequential(nn.Linear(512, 512, bias=False),
+                                  Activation()
+                                 )
+                ]
+        nn.init.xavier_uniform_(layers[-1][0].weight, gain=inits[i])
+        
+    layers += [nn.Linear(512, NUM_CLASSES, bias=False)]
+    # nn.init.xavier_uniform_(layers[-1].weight, gain=0.01)
+    
+    mlp = MLP(layers)
+    
+    vgg = torchvision.models.vgg11(weights=None)
+    
+    
+    
+    _, c, _, _ = train_X.shape
+    num_channels = vgg.features[0].weight.shape[0]
+    vgg.features[0] = nn.Conv2d(c, num_channels, kernel_size=3, stride=1, padding=1, bias=False)
+    
+    print("truncating vgg network")
+    vgg.features = vgg.features[:15]
+    
+    vgg.classifier = nn.Identity()
+    vgg.avgpool = nn.Sequential(*[nn.AdaptiveAvgPool2d(output_size=(4, 4)), nn.Flatten()])
+    
+    model = nn.Sequential(*[vgg, mlp])
     model.cuda()
 
 print(model)
@@ -622,6 +707,10 @@ save_path = os.path.join('nn_figures',dir_name)
 if not os.path.isdir(save_path):
     os.mkdir(save_path)
 
+results_path = os.path.join('nn_results',dir_name)
+if not os.path.isdir(results_path):
+    os.mkdir(results_path)
+    
 fs=14
 fs2=12
 
@@ -641,22 +730,37 @@ normalized_covB /= normalized_covT
 
 for use_sqrt in [True, False]:
     if use_sqrt:
-        fig_title = os.path.join(save_path, 'nfa_sqrt_agop.pdf')
+        fig_title = os.path.join(save_path, f'nfa_sqrt_agop_seed_{SEED}.pdf')
     else:
-        fig_title = os.path.join(save_path, 'nfa_full_agop.pdf')
+        fig_title = os.path.join(save_path, f'nfa_full_agop_seed_{SEED}.pdf')
         
     fig, axes = plt.subplots(1,3)
     ax1, ax2, ax3 = axes
     ax1.semilogy(np.arange(0, len(normalized_covB)*MEASURE_EVERY, MEASURE_EVERY), normalized_covB, label=r'$tr(\Sigma^L_B) / tr(\Sigma^L_T)$')
     ax1.semilogy(np.arange(0, len(normalized_covW)*MEASURE_EVERY, MEASURE_EVERY), normalized_covW, label=r'$tr(\Sigma^L_W) / tr(\Sigma^L_T)$')
     ax3.semilogy(losses)
+    
+    loss_path = os.path.join(results_path, f'losses_seed_{SEED}.pt')
+    torch.save(losses, loss_path)
+    
+    covW_path = os.path.join(results_path, f'covW_seed_{SEED}.pt')
+    torch.save(normalized_covW, covW_path)
+    
+    covB_path = os.path.join(results_path, f'covB_seed_{SEED}.pt')
+    torch.save(normalized_covB, covB_path)
 
     for layer in range(NUM_LAYERS):
         if use_sqrt:
             nfa = [x[layer].cpu() for x in sqrt_nfas]
+            print(f'sqrt nfa in layer {layer}: {nfa[-1]}')
             ax2.plot(np.arange(0, len(nfa)*MEASURE_EVERY, MEASURE_EVERY), nfa, label=f'Layer {layer+1}')
+            
+            nfa_path = os.path.join(results_path, f'sqrt_nfa_layer_{layer}_seed_{SEED}.pt')
+            torch.save(nfa, nfa_path)
+            
         else:
             nfa = [x[layer].cpu() for x in nfas]
+            print(f'full nfa in layer {layer}: {nfa[-1]}')
             ax2.plot(np.arange(0, len(nfa)*MEASURE_EVERY, MEASURE_EVERY), nfa, label=f'Layer {layer+1}')
 
     ax2.set_yticks(torch.linspace(0,1,11))
@@ -687,6 +791,10 @@ for use_sqrt in [True, False]:
 
     for ax in axes:
         ax.set_xlabel("Epochs", fontsize=fs)
+        
+    ax1.grid()
+    ax2.grid()
+    ax3.grid()
 
     # fig.suptitle("Normalized feature variance throughout training", fontsize=fs)
     fig.set_size_inches(24, 6)
@@ -738,6 +846,14 @@ fig2_log, axes2_log = plt.subplots(1, NUM_LAYERS, sharey=True)
 
 xsteps = torch.arange(0, len(models)*MEASURE_EVERY, MEASURE_EVERY).cpu()
 
+
+
+def batch_fmap(X, fmap, mb_size=20000):
+    phiXs = []
+    for Xb in torch.split(X, mb_size):
+        phiXs.append(fmap(Xb))
+    return torch.concat(phiXs, dim=0)
+
 ymax_nc1 = 0
 ymax_nc2 = 0
 for layer in range(0, NUM_LAYERS):
@@ -757,15 +873,21 @@ for layer in range(0, NUM_LAYERS):
         net.cuda()
         if model_type=='mlp':
             W = getW(net, layer)
-            # fmap = get_fmap(net, layer)
-            fmap = get_fully_linear_fmap(net, layer)
+            fmap = get_fmap(net, layer)
         elif model_type=='resnet18':
             W = getW(net[1], layer)
             fmap = get_fmap_resnet(net, layer)
             net = net[1]
+        elif model_type=='vgg11':
+            W = getW(net[1], layer)
+            fmap = get_fmap_vgg(net, layer)
+            net = net[1]
         
         with torch.no_grad():
-            phiX = fmap(train_X)
+            if model_type=='vgg11':
+                phiX = batch_fmap(train_X, fmap)
+            else:
+                phiX = fmap(train_X)
         
         # right calcs
         SigmaB, SigmaW, _, mus  = get_class_variance(phiX, train_y)
@@ -846,10 +968,24 @@ for layer in range(0, NUM_LAYERS):
     ax2.plot(xsteps, base_covs_mu, label="none")
     
     
+
+    left_fname = os.path.join(results_path, f'seed_{SEED}_layer_{layer}_nc1_left.pt')
+    right_fname = os.path.join(results_path, f'seed_{SEED}_layer_{layer}_nc1_right.pt')
+    base_fname = os.path.join(results_path, f'seed_{SEED}_layer_{layer}_nc1_base.pt')
+    
+    torch.save(left_covsW_B, left_fname)
+    torch.save(right_covsW_B, right_fname)
+    torch.save(base_covsW_B, base_fname)
+    
     ax1.set_title(f'Layer {layer+1}')
     ax2.set_title(f'Layer {layer+1}')
     ax1_log.set_title(f'Layer {layer+1}')
     ax2_log.set_title(f'Layer {layer+1}')
+    
+    ax1.grid()
+    ax2.grid()
+    ax1_log.grid()
+    ax2_log.grid()
     
     # ax.set_yticks(yticks)
     
@@ -886,10 +1022,13 @@ if dataset == 'mnist':
     yticks = [1e1,1e0,1e-1,1e-2,1e-3]
 elif dataset == 'svhn':
     yticks = [1e2, 1e1,1e0,1e-1,1e-2]
+elif model_type=='resnet18' and dataset == 'cifar':
+    yticks = [1e2, 1e1,1e0,1e-1,1e-2]
 elif dataset == 'cifar':
     yticks = [1e1,1e0,1e-1,1e-2]
     
 yticklabels = [str(x) for x in yticks]
+print("yticklabels",yticklabels)
 axes1_log[0].set_yticks(yticks)
 axes1_log[0].set_yticklabels(yticklabels)
 
@@ -926,8 +1065,8 @@ fig1.set_size_inches(3*NUM_LAYERS, 3)
 fig2.set_size_inches(3*NUM_LAYERS, 3)
 
 # plt.show()
-fig1_log.savefig(os.path.join(save_path, 'svd_nc1_log.pdf'), format='pdf', bbox_inches="tight")
-fig2_log.savefig(os.path.join(save_path, 'svd_nc2_log.pdf'), format='pdf', bbox_inches="tight")
+fig1_log.savefig(os.path.join(save_path, f'svd_nc1_log_seed_{SEED}.pdf'), format='pdf', bbox_inches="tight")
+fig2_log.savefig(os.path.join(save_path, f'svd_nc2_log_seed_{SEED}.pdf'), format='pdf', bbox_inches="tight")
 
-fig1.savefig(os.path.join(save_path, 'svd_nc1.pdf'), format='pdf', bbox_inches="tight")
-fig2.savefig(os.path.join(save_path, 'svd_nc2.pdf'), format='pdf', bbox_inches="tight")
+fig1.savefig(os.path.join(save_path, f'svd_nc1_seed_{SEED}.pdf'), format='pdf', bbox_inches="tight")
+fig2.savefig(os.path.join(save_path, f'svd_nc2_seed_{SEED}.pdf'), format='pdf', bbox_inches="tight")

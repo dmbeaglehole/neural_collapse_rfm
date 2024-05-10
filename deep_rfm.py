@@ -19,10 +19,10 @@ import torchvision.transforms as transforms
 import utils
 from functorch import jacrev, vmap
 
+import math
 
-torch.cuda.manual_seed(0)
-torch.manual_seed(0)
 
+import random
 
 parser = argparse.ArgumentParser()
 parser.add_argument('-n', type=int, default=500)
@@ -33,6 +33,7 @@ parser.add_argument('-bw', default=2.0)
 parser.add_argument('-width', default=512)
 parser.add_argument('-sigma', default=0.5)
 parser.add_argument('-use_rff', action='store_true')
+parser.add_argument('-seed', type=int, default=0)
 args = parser.parse_args()
 
 for n_, v_ in args.__dict__.items():
@@ -40,6 +41,12 @@ for n_, v_ in args.__dict__.items():
 
 ## variables
 os.environ['DATA_PATH'] = "/scratch/bbjr/dbeaglehole/"
+
+SEED = int(args.seed)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.cuda.manual_seed(SEED)
+torch.manual_seed(SEED)
 
 DEPTH = int(args.depth)
 KERNEL = args.kernel
@@ -128,6 +135,7 @@ class Activation(nn.Module):
 def sample_feats(M, d, k):
     weight_fn = nn.Linear(d, k, bias=False).to(M.device)
     weight_fn.weight = nn.Parameter(weight_fn.weight@M, requires_grad=False)
+
     return nn.Sequential(weight_fn, 
                       Activation()
                      )
@@ -267,6 +275,39 @@ test_X = preprocess(test_X)
 
 ## Run DeepRFM ##
 
+dir_path = f'figures/{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_deeprfm'
+
+
+def batch_multiply(X):
+    mb_size = 25000
+    batches = torch.split(torch.arange(len(X)), mb_size)
+    xXs = []
+    for b1 in batches:
+        Xb1 = X[b1].clone().cuda()
+        blocks = []
+        for b2 in batches:
+            Xb2 = X[b2].clone().cuda()
+            blocks.append((Xb1@Xb2.T).cpu())
+            Xb2 = Xb2.cpu()
+        Xb1 = Xb1.cpu()
+        row = torch.concat(blocks,dim=1)
+        xXs.append(row)
+    return torch.concat(xXs, dim=0)
+
+# fig, ax = plt.subplots(1, 1)
+# X = train_X.reshape(len(train_X),-1).cpu()
+# with torch.no_grad():
+#     X = X - X.mean(dim=0).unsqueeze(0)
+#     X /= X.norm(dim=1).unsqueeze(1)
+#     XXt = batch_multiply(X)
+
+# im = ax.imshow(XXt)
+# ax.set_xticks([])
+# ax.set_yticks([])
+# ax.set_title(f'Input Data', fontsize=20)
+# plt.savefig(os.path.join(dir_path, f'deep_rfm_vis_{dataset}_rff_{use_rff}_sigma_{SIGMA}_n_{n}_layer_0.pdf'), format='pdf')
+
+# exit()
 
 Xs = []
 MXs = []
@@ -278,6 +319,15 @@ train_y = train_y.to(train_X_deep.dtype).cuda()
 test_y = test_y.to(test_X_deep.dtype).cuda()
 
 del train_X, test_X
+
+def print_total_free_memory():
+    # t = torch.cuda.get_device_properties(0).total_memory
+    # r = torch.cuda.memory_reserved(0)
+    # a = torch.cuda.memory_allocated(0)
+    # print("Total free memory:",r-a)
+    a, b = torch.cuda.mem_get_info()
+    print(a//10**9, b//10**9)
+    return
 
 for dep in range(DEPTH):
     print(f'Depth {dep} of DeepRFM')
@@ -292,6 +342,7 @@ for dep in range(DEPTH):
 
     Xs.append(train_X_deep.cpu().clone())
     
+    
     if KERNEL == 'laplace':
         model = rfm.LaplaceRFM(bandwidth=BW, device="cuda")
         model.fit(
@@ -305,6 +356,7 @@ for dep in range(DEPTH):
         )
         M = model.M
         
+        
     if KERNEL == 'gaussian':
         model = rfm.GaussRFM(bandwidth=BW, device="cuda")
         model.fit(
@@ -313,16 +365,16 @@ for dep in range(DEPTH):
             loader=False, 
             iters=1,
             classif=True,
-            reg=0.,
+            reg=-1,
             M_batch_size=10000
         )
         M = model.M
-
+    
     test_X_deep = test_X_deep.cuda()
     train_X_deep = train_X_deep.cuda()
     sqrtM = matrix_sqrt(M).cuda()
     MXs.append((train_X_deep @ sqrtM).cpu())
-
+    
     _, d = train_X_deep.shape
 
     if use_rff:
@@ -334,16 +386,27 @@ for dep in range(DEPTH):
         feature_fn = lambda x: rff_model.transform(x@sqrtM)
     else:
         feature_fn = sample_feats(sqrtM, d, WIDTH)
+        feature_fn = feature_fn.cpu()
+        
        
     with torch.no_grad():
+        if not use_rff:
+            feature_fn = feature_fn.cuda()
+            
         train_X_deep = feature_fn(train_X_deep)
         test_X_deep = feature_fn(test_X_deep)
-    
-    del model
+        
+        if not use_rff:
+            feature_fn = feature_fn.cpu()
+            
+    M = M.cpu()
+    sqrtM = sqrtM.cpu()
+    del model, M, sqrtM, feature_fn
     
     PhiMXs.append(train_X_deep.cpu().clone())
-
     
+    torch.cuda.empty_cache()
+
 
 ## NC1 and NC2, SVD Plots ##
 
@@ -381,11 +444,43 @@ for layer in range(DEPTH):
     
     del X, Xr, Xl
 
+run_path = f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_deeprfm'
+results_path = os.path.join('results', run_path)
+
+try:
+    os.mkdir(results_path)
+except:
+    pass
+
+right_nc1_path = os.path.join(results_path, f'right_nc1_seed_{SEED}.pt')
+left_nc1_path = os.path.join(results_path, f'left_nc1_seed_{SEED}.pt')
+base_nc1_path = os.path.join(results_path, f'base_nc1_seed_{SEED}.pt')
+
+torch.save(right_covsW_B, right_nc1_path)
+torch.save(left_covsW_B, left_nc1_path)
+torch.save(base_covsW_B, base_nc1_path)
+
+right_nc2_path = os.path.join(results_path, f'right_nc2_seed_{SEED}.pt')
+left_nc2_path = os.path.join(results_path, f'left_nc2_seed_{SEED}.pt')
+base_nc2_path = os.path.join(results_path, f'base_nc2_seed_{SEED}.pt')
+
+torch.save(right_covs_mu, right_nc2_path)
+torch.save(left_covs_mu, left_nc2_path)
+torch.save(base_covs_mu, base_nc2_path)
 
 fig1, ax1 = plt.subplots(1, 1)
 fig1_log, ax1_log = plt.subplots(1, 1)
 fig2, ax2 = plt.subplots(1, 1)
 fig2_log, ax2_log = plt.subplots(1, 1)
+
+ax1.grid()
+ax2.grid()
+ax1_log.grid()
+ax2_log.grid()
+ax1.set_xlim(1,20)
+ax2.set_xlim(1,20)
+ax1_log.set_xlim(1,20)
+ax2_log.set_xlim(1,20)
 
 xsteps = np.arange(0,DEPTH) + 1
 ax1_log.semilogy(xsteps, left_covsW_B, label="left")
@@ -439,7 +534,7 @@ handles2, _ = ax2.get_legend_handles_labels()
 handles1_log, _ = ax1_log.get_legend_handles_labels()
 handles2_log, _ = ax2_log.get_legend_handles_labels()
 
-labels = [r'$\mathrm{ReLU}(W M^{1/2} X)$',
+labels = [r'$\Phi(M^{1/2} X)$',
           r'$M^{1/2} X$',
           r'$X$'
         ]
@@ -456,7 +551,6 @@ fig1.set_size_inches(6, 3)
 fig2.set_size_inches(6, 3)
 
 
-dir_path = f'figures/{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_deeprfm'
 print("artifact directory:",dir_path)
 try:
     print("Making directory")
@@ -464,51 +558,78 @@ try:
 except:
     pass
 
-fig1_log.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_deeprfm_nc1_log.pdf'), format='pdf', bbox_inches="tight")
-fig2_log.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_deeprfm_nc2_log.pdf'), format='pdf', bbox_inches="tight")
+fig1_log.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_seed_{SEED}_deeprfm_nc1_log.pdf'), format='pdf', bbox_inches="tight")
+fig2_log.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_seed_{SEED}_deeprfm_nc2_log.pdf'), format='pdf', bbox_inches="tight")
 
-fig1.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_deeprfm_nc1.pdf'), format='pdf', bbox_inches="tight")
-fig2.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_deeprfm_nc2.pdf'), format='pdf', bbox_inches="tight")
+fig1.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_seed_{SEED}_deeprfm_nc1.pdf'), format='pdf', bbox_inches="tight")
+fig2.savefig(os.path.join(dir_path, f'{dataset}_n_{n}_kernel_{KERNEL}_depth_{DEPTH}_rff_{use_rff}_sigma_{SIGMA}_seed_{SEED}_deeprfm_nc2.pdf'), format='pdf', bbox_inches="tight")
 
-
-
-def batch_multiply(X):
-    mb_size = 5000
-    batches = torch.split(torch.arange(len(X)), mb_size)
-    xXs = []
-    for b in batches:
-        Xb = X[b].clone()
-        xXs.append((Xb@X.T).cpu())
-        
-        del Xb
-        
-    return torch.concat(xXs, dim=0)
         
 
-for idx, X in enumerate(Xs):
-    try:
-        plt.close()
-    except:
-        pass
+# for idx, X in enumerate(Xs):
+#     try:
+#         plt.close()
+#     except:
+#         pass
     
-    if idx%2==1:
-        continue
+#     if idx%2==1:
+#         continue
         
     
         
-    fig, ax = plt.subplots(1, 1)
-    # XX = batch_multiply(X.cuda())
-    X = X - X.mean(dim=0).unsqueeze(0)
-    X /= X.norm(dim=1).unsqueeze(1)
+#     fig, ax = plt.subplots(1, 1)
+#     # XX = batch_multiply(X.cuda())
+#     with torch.no_grad():
+#         X = X - X.mean(dim=0).unsqueeze(0)
+#         X /= X.norm(dim=1).unsqueeze(1)
+#         XXt = batch_multiply(X)
     
-    im = ax.imshow(X@X.T)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_title(f'Layer {idx+1}', fontsize=20)
+#     # im = ax.imshow(X@X.T)
+#     im = ax.imshow(XXt)
+#     ax.set_xticks([])
+#     ax.set_yticks([])
+#     ax.set_title(f'Layer {idx+1}', fontsize=20)
     
-    if idx==18:
-        fig.colorbar(im, orientation='vertical')
+#     if idx==18:
+#         fig.colorbar(im, orientation='vertical')
     
-    plt.savefig(os.path.join(dir_path, f'deep_rfm_vis_{dataset}_rff_{use_rff}_sigma_{SIGMA}_n_{n}_layer_{idx}.pdf'), format='pdf')
-    del im
+#     plt.savefig(os.path.join(dir_path, f'deep_rfm_vis_{dataset}_rff_{use_rff}_sigma_{SIGMA}_n_{n}_layer_{idx}.pdf'), format='pdf')
+#     del im, XXt
+    
+# for idx, X in enumerate(MXs):
+#     try:
+#         plt.close()
+#     except:
+#         pass
+    
+#     if idx%2==1:
+#         continue
+        
+#     print("Making figs")
+#     fig, ax = plt.subplots(1, 1)
+#     # XX = batch_multiply(X.cuda())
+#     with torch.no_grad():
+#         print("Centering")
+#         X = X - X.mean(dim=0).unsqueeze(0)
+#         print("Dividing")
+#         X /= X.norm(dim=1).unsqueeze(1)
+#         print("Batch multiplying")
+#         XXt = batch_multiply(X)
+    
+#     # im = ax.imshow(X@X.T)
+#     print("Showing")
+#     im = ax.imshow(XXt)
+#     ax.set_xticks([])
+#     ax.set_yticks([])
+#     ax.set_title(f'Layer {idx+1}', fontsize=20)
+    
+#     print("Colorbar")
+#     if idx==18:
+#         fig.colorbar(im, orientation='vertical')
+    
+#     print("Saving")
+#     plt.savefig(os.path.join(dir_path, f'deep_rfm_vis_{dataset}_rff_{use_rff}_sigma_{SIGMA}_n_{n}_layer_{idx}_MXs.pdf'), format='pdf')
+    
+    
+#     del im, XXt, fig, ax
 
